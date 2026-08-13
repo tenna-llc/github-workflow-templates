@@ -1,0 +1,269 @@
+name: Create Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Release name (e.g., 2026.04)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create_release_branch:
+    runs-on: ubuntu-latest
+    outputs:
+      old_version: ${{ steps.read_version.outputs.old_version }}
+      new_version: ${{ steps.bump_main.outputs.new_version }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate release name format
+        id: validate_name
+        run: |
+          RELEASE_NAME="${{ inputs.release_name }}"
+
+          # Expected format: YYYY.MM (e.g., 2026.04)
+          if [[ ! "$RELEASE_NAME" =~ ^[0-9]{4}\.[0-9]{2}$ ]]; then
+            echo "ERROR: Invalid release name format"
+            echo "Expected: YYYY.MM (e.g., 2026.04)"
+            echo "Got: $RELEASE_NAME"
+            exit 1
+          fi
+
+          # Validate month is 01-12
+          MONTH=$(echo "$RELEASE_NAME" | cut -d'.' -f2)
+          if [[ $MONTH -lt 1 ]] || [[ $MONTH -gt 12 ]]; then
+            echo "ERROR: Invalid month in release name: $MONTH"
+            exit 1
+          fi
+
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "✓ Release name valid: $RELEASE_NAME"
+
+      - name: Check if release branch already exists
+        id: check_existing
+        run: |
+          RELEASE_NAME="${{ steps.validate_name.outputs.release_name }}"
+          BRANCH="release/$RELEASE_NAME"
+
+          if git rev-parse --verify origin/$BRANCH >/dev/null 2>&1; then
+            echo "ERROR: Release branch already exists: $BRANCH"
+            exit 1
+          fi
+
+          echo "✓ Release branch does not exist (safe to create)"
+
+      - name: Read current version from VERSION.md
+        id: read_version
+        run: |
+          if [ ! -f "VERSION.md" ]; then
+            echo "ERROR: VERSION.md not found in main branch"
+            exit 1
+          fi
+
+          # Extract version from VERSION.md (format: **Current Version:** `X.Y.Z-build.N`)
+          OLD_VERSION=$(grep -oP '(?<=`)[0-9]+\.[0-9]+\.[0-9]+-build\.[0-9]+(?=`)' VERSION.md | head -1)
+
+          if [ -z "$OLD_VERSION" ]; then
+            echo "ERROR: Could not parse version from VERSION.md"
+            cat VERSION.md
+            exit 1
+          fi
+
+          echo "old_version=$OLD_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Current version: $OLD_VERSION"
+
+      - name: Calculate new version (bump major)
+        id: bump_main
+        run: |
+          OLD_VERSION="${{ steps.read_version.outputs.old_version }}"
+
+          # Parse version: X.Y.Z-build.N
+          IFS='.-' read -r MAJOR MINOR PATCH BUILD_LABEL BUILD <<< "$OLD_VERSION"
+
+          # Bump major, reset minor/patch/build
+          NEW_MAJOR=$((MAJOR + 1))
+          NEW_VERSION="${NEW_MAJOR}.0.0-build.0"
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ New main version: $OLD_VERSION → $NEW_VERSION"
+
+      - name: Update VERSION.md in main
+        env:
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+        run: |
+          cat > VERSION.md << 'EOF'
+          # Version Info
+
+          **Current Version:** `${{ env.NEW_VERSION }}`
+          **Release Target:** `None (main branch)`
+          **Branch Type:** `main`
+          **Status:** Development branch - all new features go here
+
+          See [VERSIONING.md](VERSIONING.md) for how versioning works.
+          EOF
+
+          echo "✓ Updated VERSION.md"
+
+      - name: Update package.json version in main
+        env:
+          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+        run: |
+          # Update package.json version
+          npm version --no-git-tag-version ${{ env.NEW_VERSION }} 2>/dev/null || \
+          jq ".version = \"${{ env.NEW_VERSION }}\"" package.json > package.json.tmp && \
+          mv package.json.tmp package.json
+
+          echo "✓ Updated package.json"
+
+      - name: Commit version bump to main
+        env:
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
+          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git add VERSION.md package.json
+          git commit -m "chore: bump major version for release/${{ env.RELEASE_NAME }}
+
+          - main: ${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }}
+          - release/${{ env.RELEASE_NAME }}: frozen at ${{ env.OLD_VERSION }}"
+
+          git push origin main
+          echo "✓ Pushed version bump to main"
+
+      - name: Create release branch at old version
+        env:
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
+        run: |
+          # Checkout old commit (before version bump)
+          git checkout HEAD~1
+
+          # Create release branch
+          git checkout -b release/${{ env.RELEASE_NAME }}
+          git push -u origin release/${{ env.RELEASE_NAME }}
+
+          echo "✓ Created release/${{ env.RELEASE_NAME }} at ${{ env.OLD_VERSION }}"
+
+      - name: Create release branch VERSION.md
+        env:
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
+        run: |
+          # Update VERSION.md on release branch to indicate frozen status
+          cat > VERSION.md << 'EOF'
+          # Version Info
+
+          **Current Version:** `${{ env.OLD_VERSION }}`
+          **Release Target:** `${{ env.RELEASE_NAME }}`
+          **Branch Type:** `release/${{ env.RELEASE_NAME }}`
+          **Status:** QA/Production - hotfixes and interim releases only
+
+          See [VERSIONING.md](VERSIONING.md) for how versioning works.
+          EOF
+
+          git add VERSION.md
+          git commit -m "chore: update VERSION.md for release/${{ env.RELEASE_NAME }}"
+          git push origin release/${{ env.RELEASE_NAME }}
+
+          echo "✓ Updated release branch VERSION.md"
+
+      - name: Checkout back to main
+        run: |
+          git checkout main
+          git pull origin main
+
+      - name: Send Teams notification
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
+          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "⚠ TEAMS_WEBHOOK_URL not configured. Skipping notification."
+            exit 0
+          fi
+
+          PAYLOAD=$(cat <<'EOF_PAYLOAD'
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": "Release branch created",
+            "themeColor": "0078D4",
+            "title": "Release Branch Created: ${{ env.RELEASE_NAME }}",
+            "sections": [
+              {
+                "activityTitle": "Release Branch Created",
+                "activitySubtitle": "${{ env.REPO }}",
+                "facts": [
+                  {
+                    "name": "Release",
+                    "value": "${{ env.RELEASE_NAME }}"
+                  },
+                  {
+                    "name": "Main version bump",
+                    "value": "${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }}"
+                  },
+                  {
+                    "name": "Release branch frozen at",
+                    "value": "${{ env.OLD_VERSION }}"
+                  },
+                  {
+                    "name": "Triggered by",
+                    "value": "${{ env.ACTOR }}"
+                  }
+                ],
+                "markdown": true
+              }
+            ],
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name": "View Release Branch",
+                "targets": [
+                  {
+                    "os": "default",
+                    "uri": "https://github.com/${{ env.REPO }}/tree/release/${{ env.RELEASE_NAME }}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF_PAYLOAD
+          )
+
+          curl -X POST -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            "$TEAMS_WEBHOOK_URL"
+
+          echo "✓ Teams notification sent"
+
+      - name: Summary
+        env:
+          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
+          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
+          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+        run: |
+          echo "## Release Branch Created ✓"
+          echo ""
+          echo "| Item | Value |"
+          echo "|------|-------|"
+          echo "| Release | ${{ env.RELEASE_NAME }} |"
+          echo "| Branch | release/${{ env.RELEASE_NAME }} |"
+          echo "| Main bumped | ${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }} |"
+          echo "| Release frozen at | ${{ env.OLD_VERSION }} |"
