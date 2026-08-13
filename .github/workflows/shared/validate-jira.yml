@@ -1,0 +1,75 @@
+name: Validate JIRA Ticket
+description: Validates that a JIRA ticket exists and is in correct status
+
+inputs:
+  ticket:
+    description: "JIRA ticket ID (e.g., TS-1234)"
+    required: true
+  jira_api_token:
+    description: "JIRA API token (base64 encoded)"
+    required: true
+  jira_email:
+    description: "JIRA account email"
+    required: true
+
+outputs:
+  ticket_found:
+    description: "Whether ticket was found (true/false)"
+    value: ${{ steps.check_ticket.outputs.found }}
+  ticket_status:
+    description: "Current ticket status"
+    value: ${{ steps.check_ticket.outputs.status }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate ticket format
+      id: validate_format
+      shell: bash
+      run: |
+        TICKET="${{ inputs.ticket }}"
+        if [[ ! "$TICKET" =~ ^TS-[0-9]+$ ]]; then
+          echo "ERROR: Invalid JIRA ticket format. Expected TS-XXXX, got: $TICKET"
+          exit 1
+        fi
+        echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+
+    - name: Query JIRA API
+      id: check_ticket
+      shell: bash
+      env:
+        JIRA_EMAIL: ${{ inputs.jira_email }}
+        JIRA_API_TOKEN: ${{ inputs.jira_api_token }}
+      run: |
+        TICKET="${{ steps.validate_format.outputs.ticket }}"
+
+        # Query JIRA REST API v3
+        RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+          "https://tenna.atlassian.net/rest/api/3/issue/$TICKET" \
+          -H "Content-Type: application/json")
+
+        # Check if ticket exists (response should contain 'key' field)
+        if echo "$RESPONSE" | jq -e '.key' > /dev/null 2>&1; then
+          FOUND=true
+          STATUS=$(echo "$RESPONSE" | jq -r '.fields.status.name // "Unknown"')
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "✓ Ticket $TICKET found with status: $STATUS"
+        else
+          FOUND=false
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo "status=NOT_FOUND" >> $GITHUB_OUTPUT
+          echo "ERROR: Ticket $TICKET not found in JIRA"
+          echo "Response: $RESPONSE"
+          exit 1
+        fi
+
+    - name: Validate ticket status
+      shell: bash
+      run: |
+        STATUS="${{ steps.check_ticket.outputs.status }}"
+        # Allow tickets in these statuses: In Progress, In Review, Done
+        if [[ ! "$STATUS" =~ ^(In\ Progress|In\ Review|Done)$ ]]; then
+          echo "⚠ WARNING: Ticket status is '$STATUS' (expected In Progress, In Review, or Done)"
+          echo "You may proceed, but verify this is intentional."
+        fi

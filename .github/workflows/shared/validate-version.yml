@@ -1,0 +1,103 @@
+name: Validate Version and Bump Type
+description: Validates version format and ensures bump type matches branch strategy
+
+inputs:
+  current_version:
+    description: "Current version (e.g., 1.2.3-build.5)"
+    required: true
+  bump_type:
+    description: "Requested bump type (major/minor/patch)"
+    required: true
+  branch_name:
+    description: "Target branch name"
+    required: true
+
+outputs:
+  is_valid:
+    description: "Whether validation passed (true/false)"
+    value: ${{ steps.validate.outputs.valid }}
+  new_version:
+    description: "Calculated new version"
+    value: ${{ steps.calculate.outputs.new_version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate version format
+      id: validate_format
+      shell: bash
+      run: |
+        VERSION="${{ inputs.current_version }}"
+        # Expected format: X.Y.Z-build.N
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-build\.[0-9]+$ ]]; then
+          echo "ERROR: Invalid version format. Expected X.Y.Z-build.N, got: $VERSION"
+          exit 1
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "✓ Version format valid: $VERSION"
+
+    - name: Check bump type against branch
+      id: validate_bump
+      shell: bash
+      run: |
+        BRANCH="${{ inputs.branch_name }}"
+        BUMP="${{ inputs.bump_type }}"
+
+        # Extract branch type (e.g., "release" from "release/2026.04")
+        BRANCH_TYPE=$(echo "$BRANCH" | cut -d'/' -f1)
+
+        if [[ "$BRANCH_TYPE" == "release" ]]; then
+          # On release branches, only patch and minor (interim) are allowed
+          if [[ "$BUMP" == "major" ]]; then
+            echo "ERROR: Cannot bump MAJOR on release branch ($BRANCH)"
+            echo "Major bumps only allowed when creating new release branch from main"
+            exit 1
+          fi
+          echo "valid=true" >> $GITHUB_OUTPUT
+          echo "✓ Bump type '$BUMP' is valid for release branch"
+        elif [[ "$BRANCH_TYPE" == "main" ]] || [[ "$BRANCH" == "main" ]]; then
+          # On main, only auto-tags are typically used, but allow manual minor for interim
+          if [[ "$BUMP" == "major" ]]; then
+            echo "⚠ WARNING: Major bumps on main are typically done via create-release-branch workflow"
+            echo "Proceeding with caution..."
+          fi
+          echo "valid=true" >> $GITHUB_OUTPUT
+          echo "✓ Bump type '$BUMP' is valid for main branch"
+        else
+          # Feature branches should not be bumped
+          echo "ERROR: Cannot bump version on feature branch ($BRANCH)"
+          echo "Only main and release/* branches can have version bumps"
+          exit 1
+        fi
+
+    - name: Calculate new version
+      id: calculate
+      shell: bash
+      run: |
+        VERSION="${{ steps.validate_format.outputs.version }}"
+        BUMP="${{ inputs.bump_type }}"
+
+        # Parse current version
+        IFS='.-' read -r MAJOR MINOR PATCH BUILD_LABEL BUILD <<< "$VERSION"
+
+        case "$BUMP" in
+          major)
+            NEW_MAJOR=$((MAJOR + 1))
+            NEW_VERSION="${NEW_MAJOR}.0.0-build.0"
+            ;;
+          minor)
+            NEW_MINOR=$((MINOR + 1))
+            NEW_VERSION="${MAJOR}.${NEW_MINOR}.0-build.0"
+            ;;
+          patch)
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-build.0"
+            ;;
+          *)
+            echo "ERROR: Unknown bump type: $BUMP"
+            exit 1
+            ;;
+        esac
+
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "✓ Version bump: $VERSION → $NEW_VERSION"
