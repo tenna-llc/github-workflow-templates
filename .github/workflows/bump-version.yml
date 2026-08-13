@@ -1,0 +1,366 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - "patch (hotfix)"
+          - "minor (interim release)"
+      branch_name:
+        description: "Branch to bump (e.g., release/2026.04 or main)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump_version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch_name }}
+          fetch-depth: 0
+
+      - name: Validate branch name format
+        id: validate_branch
+        run: |
+          BRANCH="${{ inputs.branch_name }}"
+
+          if [[ ! "$BRANCH" =~ ^(main|release/[0-9]{4}\.[0-9]{2}(\.?[0-9]{2})?)$ ]]; then
+            echo "ERROR: Invalid branch name"
+            echo "Expected: main or release/YYYY.MM or release/YYYY.MM.NN"
+            echo "Got: $BRANCH"
+            exit 1
+          fi
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Read current version
+        id: read_version
+        run: |
+          if [ ! -f "VERSION.md" ]; then
+            echo "ERROR: VERSION.md not found"
+            exit 1
+          fi
+
+          VERSION=$(grep -oP '(?<=`)[0-9]+\.[0-9]+\.[0-9]+-build\.[0-9]+(?=`)' VERSION.md | head -1)
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not parse version from VERSION.md"
+            exit 1
+          fi
+
+          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract JIRA ticket from branch or commit
+        id: extract_ticket
+        run: |
+          # Try to extract from branch name first
+          TICKET=$(echo "${{ inputs.branch_name }}" | grep -oE 'TS-[0-9]+' || echo "")
+
+          # If not in branch name, try last 5 commits
+          if [ -z "$TICKET" ]; then
+            TICKET=$(git log -5 --oneline | grep -oE 'TS-[0-9]+' | head -1 || echo "")
+          fi
+
+          if [ -z "$TICKET" ]; then
+            echo "WARNING: Could not find JIRA ticket in branch name or recent commits"
+            echo "ticket_found=false" >> $GITHUB_OUTPUT
+            echo "ticket=" >> $GITHUB_OUTPUT
+          else
+            echo "ticket_found=true" >> $GITHUB_OUTPUT
+            echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate JIRA ticket (if found)
+        if: steps.extract_ticket.outputs.ticket_found == 'true'
+        id: validate_jira
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          TICKET="${{ steps.extract_ticket.outputs.ticket }}"
+
+          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+            echo "WARNING: JIRA secrets not configured. Skipping ticket validation."
+            echo "Please set JIRA_EMAIL and JIRA_API_TOKEN in GitHub secrets."
+            exit 0
+          fi
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            "https://tenna.atlassian.net/rest/api/3/issue/$TICKET" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Ticket $TICKET not found in JIRA (HTTP $HTTP_CODE)"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+          STATUS=$(echo "$BODY" | jq -r '.fields.status.name // "Unknown"')
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "✓ Ticket $TICKET found with status: $STATUS"
+
+      - name: Parse bump type
+        id: parse_bump
+        run: |
+          INPUT="${{ inputs.bump_type }}"
+
+          if [[ "$INPUT" == "patch"* ]]; then
+            BUMP_TYPE="patch"
+          elif [[ "$INPUT" == "minor"* ]]; then
+            BUMP_TYPE="minor"
+          else
+            echo "ERROR: Unknown bump type"
+            exit 1
+          fi
+
+          echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Validate bump type against branch
+        env:
+          BUMP_TYPE: ${{ steps.parse_bump.outputs.bump_type }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+        run: |
+          BRANCH_TYPE=$(echo "${{ env.BRANCH }}" | cut -d'/' -f1)
+
+          if [[ "${{ env.BRANCH }}" == "main" ]]; then
+            echo "ERROR: Cannot manually bump version on main branch"
+            echo "Main branch uses automatic versioning. Create a release branch instead."
+            exit 1
+          fi
+
+          if [[ "$BRANCH_TYPE" == "release" ]]; then
+            if [[ "${{ env.BUMP_TYPE }}" == "major" ]]; then
+              echo "ERROR: Cannot bump MAJOR on release branch"
+              exit 1
+            fi
+            echo "✓ Bump type valid for release branch"
+          fi
+
+      - name: Calculate new version
+        id: calculate
+        env:
+          CURRENT: ${{ steps.read_version.outputs.current_version }}
+          BUMP_TYPE: ${{ steps.parse_bump.outputs.bump_type }}
+        run: |
+          VERSION="${{ env.CURRENT }}"
+
+          IFS='.-' read -r MAJOR MINOR PATCH BUILD_LABEL BUILD <<< "$VERSION"
+
+          case "${{ env.BUMP_TYPE }}" in
+            patch)
+              NEW_PATCH=$((PATCH + 1))
+              NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-build.0"
+              ;;
+            minor)
+              NEW_MINOR=$((MINOR + 1))
+              NEW_VERSION="${MAJOR}.${NEW_MINOR}.0-build.0"
+              ;;
+          esac
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION → $NEW_VERSION"
+
+      - name: Display confirmation summary
+        env:
+          CURRENT: ${{ steps.read_version.outputs.current_version }}
+          NEW: ${{ steps.calculate.outputs.new_version }}
+          BUMP: ${{ steps.parse_bump.outputs.bump_type }}
+          TICKET: ${{ steps.extract_ticket.outputs.ticket }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+        run: |
+          echo "## Version Bump Summary"
+          echo ""
+          echo "**Current Version:** ${{ env.CURRENT }}"
+          echo "**New Version:** ${{ env.NEW }}"
+          echo "**Bump Type:** ${{ env.BUMP }}"
+          echo "**Branch:** ${{ env.BRANCH }}"
+          echo "**JIRA Ticket:** ${{ env.TICKET }}"
+          echo ""
+          echo "✓ All validations passed. Proceeding with version bump..."
+
+      - name: Update VERSION.md
+        env:
+          NEW_VERSION: ${{ steps.calculate.outputs.new_version }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+        run: |
+          # Extract branch type and release name
+          if [[ "${{ env.BRANCH }}" == "release/"* ]]; then
+            RELEASE=$(echo "${{ env.BRANCH }}" | cut -d'/' -f2)
+            STATUS="Production hotfixes and interim releases only"
+          else
+            RELEASE="None"
+            STATUS="Development branch"
+          fi
+
+          cat > VERSION.md << 'EOF'
+          # Version Info
+
+          **Current Version:** `${{ env.NEW_VERSION }}`
+          **Release Target:** `${{ env.RELEASE }}`
+          **Branch Type:** `${{ env.BRANCH }}`
+          **Status:** ${{ env.STATUS }}
+
+          See [VERSIONING.md](VERSIONING.md) for how versioning works.
+          EOF
+
+      - name: Update package.json
+        env:
+          NEW_VERSION: ${{ steps.calculate.outputs.new_version }}
+        run: |
+          # Update package.json if it exists
+          if [ -f "package.json" ]; then
+            jq ".version = \"${{ env.NEW_VERSION }}\"" package.json > package.json.tmp && \
+            mv package.json.tmp package.json
+            echo "✓ Updated package.json"
+          fi
+
+      - name: Create commit and tag
+        id: commit
+        env:
+          NEW_VERSION: ${{ steps.calculate.outputs.new_version }}
+          BUMP_TYPE: ${{ steps.parse_bump.outputs.bump_type }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+          TICKET: ${{ steps.extract_ticket.outputs.ticket }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          # Create descriptive commit message
+          BUMP_DESC="Bump"
+          case "${{ env.BUMP_TYPE }}" in
+            patch) BUMP_DESC="Patch (hotfix)" ;;
+            minor) BUMP_DESC="Minor (interim release)" ;;
+          esac
+
+          COMMIT_MSG="chore: $BUMP_DESC version to ${{ env.NEW_VERSION }}"
+          if [ ! -z "${{ env.TICKET }}" ]; then
+            COMMIT_MSG="$COMMIT_MSG
+
+          ${{ env.TICKET }}"
+          fi
+
+          git add VERSION.md package.json 2>/dev/null || true
+          git commit -m "$COMMIT_MSG"
+          git tag "v${{ env.NEW_VERSION }}"
+          git push origin ${{ env.BRANCH }}
+          git push origin "v${{ env.NEW_VERSION }}"
+
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "✓ Pushed commit and tag"
+
+      - name: Send Teams notification
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+          CURRENT: ${{ steps.read_version.outputs.current_version }}
+          NEW: ${{ steps.calculate.outputs.new_version }}
+          BUMP_TYPE: ${{ steps.parse_bump.outputs.bump_type }}
+          TICKET: ${{ steps.extract_ticket.outputs.ticket }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "${{ env.TEAMS_WEBHOOK_URL }}" ]; then
+            echo "⚠ TEAMS_WEBHOOK_URL not configured. Skipping notification."
+            exit 0
+          fi
+
+          PAYLOAD=$(cat <<'EOF_PAYLOAD'
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": "Version bumped",
+            "themeColor": "28a745",
+            "title": "Version Bumped: ${{ env.CURRENT }} → ${{ env.NEW }}",
+            "sections": [
+              {
+                "activityTitle": "Version Bump Complete",
+                "activitySubtitle": "${{ env.REPO }}",
+                "facts": [
+                  {
+                    "name": "Branch",
+                    "value": "${{ env.BRANCH }}"
+                  },
+                  {
+                    "name": "Bump Type",
+                    "value": "${{ env.BUMP_TYPE }}"
+                  },
+                  {
+                    "name": "Previous Version",
+                    "value": "${{ env.CURRENT }}"
+                  },
+                  {
+                    "name": "New Version",
+                    "value": "${{ env.NEW }}"
+                  },
+                  {
+                    "name": "JIRA Ticket",
+                    "value": "${{ env.TICKET }}"
+                  },
+                  {
+                    "name": "Triggered by",
+                    "value": "${{ env.ACTOR }}"
+                  }
+                ],
+                "markdown": true
+              }
+            ],
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name": "View Tag",
+                "targets": [
+                  {
+                    "os": "default",
+                    "uri": "https://github.com/${{ env.REPO }}/releases/tag/v${{ env.NEW }}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF_PAYLOAD
+          )
+
+          curl -X POST -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            "${{ env.TEAMS_WEBHOOK_URL }}"
+
+      - name: Create GitHub Release
+        env:
+          NEW_VERSION: ${{ steps.calculate.outputs.new_version }}
+          BRANCH: ${{ steps.validate_branch.outputs.branch }}
+        run: |
+          # Generate release notes from recent commits
+          RECENT_COMMITS=$(git log $(git describe --tags --abbrev=0 2>/dev/null || echo "HEAD~10")..HEAD --oneline 2>/dev/null | sed 's/^/- /' || echo "- Initial release")
+
+          gh release create "v${{ env.NEW_VERSION }}" \
+            --target "${{ env.BRANCH }}" \
+            --title "Release ${{ env.NEW_VERSION }}" \
+            --notes "## Changelog
+
+          $RECENT_COMMITS" \
+            2>/dev/null || echo "✓ Release tag already exists"
+
+      - name: Summary
+        env:
+          CURRENT: ${{ steps.read_version.outputs.current_version }}
+          NEW: ${{ steps.calculate.outputs.new_version }}
+          BUMP_TYPE: ${{ steps.parse_bump.outputs.bump_type }}
+        run: |
+          echo "## Version Bump Complete ✓"
+          echo ""
+          echo "**Previous:** ${{ env.CURRENT }}"
+          echo "**New:** ${{ env.NEW }}"
+          echo "**Type:** ${{ env.BUMP_TYPE }}"
