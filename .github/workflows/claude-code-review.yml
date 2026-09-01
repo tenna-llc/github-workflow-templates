@@ -1,0 +1,109 @@
+name: Claude PR Review (manual)
+
+# Manually triggered only — restricted to members of the tenna-llc "team-leads"
+# GitHub team, checked explicitly below (workflow_dispatch alone only requires
+# repo write access, which is broader than "team leads"). Never runs
+# automatically, and never blocks the PR: it posts one advisory comment and
+# never fails the job or submits a REQUEST_CHANGES review.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: claude-review-${{ github.repository }}-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-team-lead:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify caller is on team-leads
+        env:
+          # PAT with `read:org` scope — the default GITHUB_TOKEN cannot read
+          # private org team membership. Org-level secret; see SETUP.md.
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          STATUS=$(gh api "orgs/${{ github.repository_owner }}/teams/team-leads/memberships/${{ github.actor }}" \
+            --jq '.state' 2>/dev/null || echo "not_found")
+
+          if [ "$STATUS" != "active" ]; then
+            echo "::error::${{ github.actor }} is not an active member of the team-leads team. This workflow can only be triggered by team leads."
+            exit 1
+          fi
+
+          echo "✓ ${{ github.actor }} verified as team lead"
+
+  review:
+    needs: verify-team-lead
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/pull/${{ inputs.pr_number }}/head
+
+      # Cross-repo consistency reference. Seed STANDARDS.md lives in this template
+      # repo so every consuming repo's review checks against the same doc.
+      - name: Checkout Tenna engineering standards
+        uses: actions/checkout@v4
+        with:
+          repository: tenna-llc/github-workflow-templates
+          sparse-checkout: |
+            STANDARDS.md
+          sparse-checkout-cone-mode: false
+          path: .tenna-standards
+
+      - name: Claude PR Review
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review pull request #${{ inputs.pr_number }} in ${{ github.repository }}.
+            Run `gh pr diff ${{ inputs.pr_number }}` for the changes, and read
+            surrounding files in the checkout for context as needed.
+
+            This is NOT a generic code-quality/style pass — CI and lint already cover
+            that, don't repeat it. Review only these four things:
+
+            1. LOGIC CORRECTNESS: Trace the actual execution path the change
+               introduces or modifies against what the PR title/description/linked
+               ticket says it's for. Check edge cases the author's own tests don't
+               cover — empty/nil inputs, error paths, and especially whether a
+               retry/replay of any loop could re-emit a side effect (queue publish,
+               DB write, webhook call) that already happened once.
+
+            2. REPO-LOCAL CONSISTENCY: Grep this repo for how similar problems are
+               already solved elsewhere in it. Flag anywhere this PR solves the same
+               kind of problem a different way with no stated reason.
+
+            3. ORG-WIDE CONSISTENCY: If `.tenna-standards/STANDARDS.md` exists in the
+               checkout, treat it as the canonical cross-repo convention doc — flag
+               any deviation from it, citing the section. If the file isn't present,
+               skip this check rather than guessing at conventions you can't verify.
+
+            4. UNNECESSARY CHANGES: Call out anything in the diff not required to
+               accomplish the PR's stated purpose — unrelated refactors, premature
+               abstractions, dead code, renames with no stated reason, scope creep.
+               Name the specific file/lines and why each is out of scope.
+
+            Post ONE comment via:
+              gh pr comment ${{ inputs.pr_number }} --repo ${{ github.repository }} --body-file -
+            This is advisory only: never use the PR review/approval API, never
+            request changes. Structure the comment as a one-line verdict, then
+            findings grouped under the four headings above — omit any heading with
+            nothing to report. If a heading has nothing, leave it out rather than
+            writing "no issues found."
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr comment:*)"
