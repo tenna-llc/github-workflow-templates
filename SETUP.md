@@ -44,6 +44,27 @@ In your GitHub repo settings:
    - **JIRA_EMAIL:** Your Tenna email (e.g., firstname.lastname@tenna.com)
    - **TEAMS_WEBHOOK_URL:** Paste the webhook URL from Step 3
 
+## Step 4b: Enable claude-code-review.yml (optional, one-time at the org level)
+
+Unlike Steps 2–4 above, these secrets are **org-level**, configured once for
+all of `tenna-llc` rather than per-repo — a repo owner only needs to confirm
+their repo is included if the secret is scoped to "selected repositories."
+
+1. **`ANTHROPIC_API_KEY`** — an Anthropic API key with billing set up. Org
+   admin adds it under the `tenna-llc` org's Settings → Secrets and
+   variables → Actions → New organization secret.
+2. **`ORG_READ_TOKEN`** — a GitHub PAT with `read:org` scope, owned by a
+   bot/service account (not a personal token, so it doesn't break when
+   someone leaves or rotates their own credentials). Used only to check
+   `team-leads` membership before letting the workflow run. Added the same
+   way, as an org secret.
+3. Confirm the `team-leads` team exists and has the right members —
+   `claude-code-review.yml` will only run for people on that team:
+   https://github.com/orgs/tenna-llc/teams/team-leads
+
+No repo-level secret is needed for this workflow once the two org secrets
+above exist and are visible to the repo.
+
 ## Step 5: Create VERSION.md
 
 Create file: `VERSION.md`
@@ -179,6 +200,8 @@ git commit -m "docs: add version tracking and versioning guide"
 - [ ] Created VERSIONING.md in repo root
 - [ ] Committed all changes to main
 - [ ] Tested bump-version workflow with test branch
+- [ ] (Optional) Confirmed org-level `ANTHROPIC_API_KEY` and `ORG_READ_TOKEN`
+      are visible to this repo, if using `claude-code-review.yml`
 
 ## Next Steps
 
