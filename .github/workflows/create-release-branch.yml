@@ -1,269 +1,237 @@
-name: Create Release Branch
+name: Create release branch
 
 on:
   workflow_dispatch:
     inputs:
       release_name:
-        description: "Release name (e.g., 2026.04)"
+        description: 'Release branch name without the release/ prefix. Format YYYY.MM or YYYY.MM.NN'
         required: true
         type: string
-
-permissions:
-  contents: write
-  pull-requests: write
+      version_bump:
+        description: 'Version part to bump on the default branch. major is only allowed on the default branch.'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - release
+        default: major
+        required: true
+      source_ref:
+        description: 'Optional commit SHA, tag or branch to cut the release branch from. Leave empty to use the tip of the ref this run was dispatched from.'
+        type: string
+        required: false
+        default: ''
 
 jobs:
-  create_release_branch:
+  create-release-branch:
+    name: Create release branch
     runs-on: ubuntu-latest
-    outputs:
-      old_version: ${{ steps.read_version.outputs.old_version }}
-      new_version: ${{ steps.bump_main.outputs.new_version }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_NAME: ${{ inputs.release_name }}
+      VERSION_BUMP: ${{ inputs.version_bump }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      PREID: 'build'
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      CURRENT_BRANCH: ${{ github.ref_name }}
     steps:
-      - name: Checkout main branch
-        uses: actions/checkout@v4
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$RELEASE_NAME" =~ ^[0-9]{4}\.[0-9]{2}(\.[0-9]{2})?$ ]]; then
+            echo "::error::release_name must be YYYY.MM or YYYY.MM.NN (got '$RELEASE_NAME')"
+            exit 1
+          fi
+
+          case "$VERSION_BUMP" in
+            major|minor|patch|release) ;;
+            *) echo "::error::version_bump must be major, minor, patch or release (got '$VERSION_BUMP')"; exit 1 ;;
+          esac
+
+          # A major bump belongs to the default branch only.
+          if [ "$VERSION_BUMP" = "major" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::Refusing to bump major on '$CURRENT_BRANCH'."
+            echo "::error::Only the default branch ('$DEFAULT_BRANCH') may take a major bump."
+            echo "::error::For a hotfix or interim release on a release branch, use the Bump Version workflow."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
         with:
-          ref: main
           fetch-depth: 0
 
-      - name: Validate release name format
-        id: validate_name
-        run: |
-          RELEASE_NAME="${{ inputs.release_name }}"
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
 
-          # Expected format: YYYY.MM (e.g., 2026.04)
-          if [[ ! "$RELEASE_NAME" =~ ^[0-9]{4}\.[0-9]{2}$ ]]; then
-            echo "ERROR: Invalid release name format"
-            echo "Expected: YYYY.MM (e.g., 2026.04)"
-            echo "Got: $RELEASE_NAME"
+      - name: Configure git identity
+        env:
+          GIT_COMMITTER_EMAIL: ${{ secrets.GIT_COMMITTER_EMAIL }}
+          GIT_COMMITTER_NAME: ${{ secrets.GIT_COMMITTER_NAME }}
+        run: |
+          set -euo pipefail
+          git config user.email "${GIT_COMMITTER_EMAIL:-actions@tenna.com}"
+          git config user.name "${GIT_COMMITTER_NAME:-tenna-actions}"
+
+      # Everything that can be known before we mutate anything is checked here, so a
+      # predictable failure never leaves a half-created release behind.
+      - name: Preflight
+        id: preflight
+        run: |
+          set -euo pipefail
+
+          RELEASE_BRANCH="release/$RELEASE_NAME"
+
+          # 1. Release branch must not already exist.
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            echo "::error::$RELEASE_BRANCH already exists on origin."
+            echo "::error::Pick a different release_name, or delete the existing branch first."
             exit 1
           fi
 
-          # Validate month is 01-12
-          MONTH=$(echo "$RELEASE_NAME" | cut -d'.' -f2)
-          if [[ $MONTH -lt 1 ]] || [[ $MONTH -gt 12 ]]; then
-            echo "ERROR: Invalid month in release name: $MONTH"
+          # 2. source_ref, when given, must resolve to a commit.
+          if [ -n "$SOURCE_REF" ]; then
+            # actions/checkout only creates a local ref for the branch it checked out, so a
+            # branch name given as source_ref resolves only via origin/. Try the literal ref
+            # first (covers SHAs and tags), then the remote-tracking form.
+            if git rev-parse --verify "${SOURCE_REF}^{commit}" >/dev/null 2>&1; then
+              SOURCE_SHA=$(git rev-parse "${SOURCE_REF}^{commit}")
+            elif git rev-parse --verify "origin/${SOURCE_REF}^{commit}" >/dev/null 2>&1; then
+              SOURCE_SHA=$(git rev-parse "origin/${SOURCE_REF}^{commit}")
+            else
+              echo "::error::source_ref '$SOURCE_REF' does not resolve to a commit."
+              echo "::error::Pass a full commit SHA, an existing tag, or an existing branch name (for example release/2026.04)."
+              exit 1
+            fi
+          else
+            SOURCE_SHA=$(git rev-parse HEAD)
+          fi
+
+          # 3. Work out the tag this run will produce, and refuse early if it is taken.
+          #    The bump applies to the default branch, so the current version is read
+          #    from there rather than from the dispatch ref.
+          case "$VERSION_BUMP" in
+            major)   NPM_BUMP=major   ;;
+            minor)   NPM_BUMP=minor   ;;
+            patch)   NPM_BUMP=patch   ;;
+            release) NPM_BUMP=release ;;
+          esac
+
+          if [ -n "$PREID" ]; then
+            if [ "$NPM_BUMP" = "release" ]; then
+              NPM_BUMP=prerelease
+            else
+              NPM_BUMP="pre${NPM_BUMP}"
+            fi
+          elif [ "$NPM_BUMP" = "release" ]; then
+            echo "::error::version_bump=release requires build numbers, but preid is empty."
             exit 1
           fi
 
-          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
-          echo "✓ Release name valid: $RELEASE_NAME"
+          # Compute the next version against a throwaway copy of the default branch's
+          # package.json, using npm itself so the preflight and the real bump can never
+          # disagree about semantics.
+          PREDICT_DIR=$(mktemp -d)
+          git show "origin/${DEFAULT_BRANCH}:package.json" > "$PREDICT_DIR/package.json"
+          if [ -n "$PREID" ]; then
+            NEXT_TAG=$(cd "$PREDICT_DIR" && npm version "$NPM_BUMP" --preid "$PREID" --no-git-tag-version)
+          else
+            NEXT_TAG=$(cd "$PREDICT_DIR" && npm version "$NPM_BUMP" --no-git-tag-version)
+          fi
+          rm -rf "$PREDICT_DIR"
 
-      - name: Check if release branch already exists
-        id: check_existing
-        run: |
-          RELEASE_NAME="${{ steps.validate_name.outputs.release_name }}"
-          BRANCH="release/$RELEASE_NAME"
-
-          if git rev-parse --verify origin/$BRANCH >/dev/null 2>&1; then
-            echo "ERROR: Release branch already exists: $BRANCH"
+          if git ls-remote --exit-code --tags origin "refs/tags/${NEXT_TAG}" >/dev/null 2>&1; then
+            CURRENT_VERSION=$(git show "origin/${DEFAULT_BRANCH}:package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+            echo "::error::Tag ${NEXT_TAG} already exists on origin, so this run would fail partway through."
+            echo "::error::${DEFAULT_BRANCH} is at ${CURRENT_VERSION} and a '${VERSION_BUMP}' bump targets ${NEXT_TAG}."
+            echo "::error::Delete the stale tag, or pick a version_bump that lands on a free version."
             exit 1
           fi
 
-          echo "✓ Release branch does not exist (safe to create)"
-
-      - name: Read current version from VERSION.md
-        id: read_version
-        run: |
-          if [ ! -f "VERSION.md" ]; then
-            echo "ERROR: VERSION.md not found in main branch"
-            exit 1
-          fi
-
-          # Extract version from VERSION.md (format: **Current Version:** `X.Y.Z-build.N`)
-          OLD_VERSION=$(grep -oP '(?<=`)[0-9]+\.[0-9]+\.[0-9]+-build\.[0-9]+(?=`)' VERSION.md | head -1)
-
-          if [ -z "$OLD_VERSION" ]; then
-            echo "ERROR: Could not parse version from VERSION.md"
-            cat VERSION.md
-            exit 1
-          fi
-
-          echo "old_version=$OLD_VERSION" >> $GITHUB_OUTPUT
-          echo "✓ Current version: $OLD_VERSION"
-
-      - name: Calculate new version (bump major)
-        id: bump_main
-        run: |
-          OLD_VERSION="${{ steps.read_version.outputs.old_version }}"
-
-          # Parse version: X.Y.Z-build.N
-          IFS='.-' read -r MAJOR MINOR PATCH BUILD_LABEL BUILD <<< "$OLD_VERSION"
-
-          # Bump major, reset minor/patch/build
-          NEW_MAJOR=$((MAJOR + 1))
-          NEW_VERSION="${NEW_MAJOR}.0.0-build.0"
-
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "✓ New main version: $OLD_VERSION → $NEW_VERSION"
-
-      - name: Update VERSION.md in main
-        env:
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
-        run: |
-          cat > VERSION.md << 'EOF'
-          # Version Info
-
-          **Current Version:** `${{ env.NEW_VERSION }}`
-          **Release Target:** `None (main branch)`
-          **Branch Type:** `main`
-          **Status:** Development branch - all new features go here
-
-          See [VERSIONING.md](VERSIONING.md) for how versioning works.
-          EOF
-
-          echo "✓ Updated VERSION.md"
-
-      - name: Update package.json version in main
-        env:
-          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
-        run: |
-          # Update package.json version
-          npm version --no-git-tag-version ${{ env.NEW_VERSION }} 2>/dev/null || \
-          jq ".version = \"${{ env.NEW_VERSION }}\"" package.json > package.json.tmp && \
-          mv package.json.tmp package.json
-
-          echo "✓ Updated package.json"
-
-      - name: Commit version bump to main
-        env:
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
-          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
-        run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-
-          git add VERSION.md package.json
-          git commit -m "chore: bump major version for release/${{ env.RELEASE_NAME }}
-
-          - main: ${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }}
-          - release/${{ env.RELEASE_NAME }}: frozen at ${{ env.OLD_VERSION }}"
-
-          git push origin main
-          echo "✓ Pushed version bump to main"
-
-      - name: Create release branch at old version
-        env:
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
-        run: |
-          # Checkout old commit (before version bump)
-          git checkout HEAD~1
-
-          # Create release branch
-          git checkout -b release/${{ env.RELEASE_NAME }}
-          git push -u origin release/${{ env.RELEASE_NAME }}
-
-          echo "✓ Created release/${{ env.RELEASE_NAME }} at ${{ env.OLD_VERSION }}"
-
-      - name: Create release branch VERSION.md
-        env:
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
-        run: |
-          # Update VERSION.md on release branch to indicate frozen status
-          cat > VERSION.md << 'EOF'
-          # Version Info
-
-          **Current Version:** `${{ env.OLD_VERSION }}`
-          **Release Target:** `${{ env.RELEASE_NAME }}`
-          **Branch Type:** `release/${{ env.RELEASE_NAME }}`
-          **Status:** QA/Production - hotfixes and interim releases only
-
-          See [VERSIONING.md](VERSIONING.md) for how versioning works.
-          EOF
-
-          git add VERSION.md
-          git commit -m "chore: update VERSION.md for release/${{ env.RELEASE_NAME }}"
-          git push origin release/${{ env.RELEASE_NAME }}
-
-          echo "✓ Updated release branch VERSION.md"
-
-      - name: Checkout back to main
-        run: |
-          git checkout main
-          git pull origin main
-
-      - name: Send Teams notification
-        env:
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
-          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
-          REPO: ${{ github.repository }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
-            echo "⚠ TEAMS_WEBHOOK_URL not configured. Skipping notification."
-            exit 0
-          fi
-
-          PAYLOAD=$(cat <<'EOF_PAYLOAD'
           {
-            "@type": "MessageCard",
-            "@context": "https://schema.org/extensions",
-            "summary": "Release branch created",
-            "themeColor": "0078D4",
-            "title": "Release Branch Created: ${{ env.RELEASE_NAME }}",
-            "sections": [
-              {
-                "activityTitle": "Release Branch Created",
-                "activitySubtitle": "${{ env.REPO }}",
-                "facts": [
-                  {
-                    "name": "Release",
-                    "value": "${{ env.RELEASE_NAME }}"
-                  },
-                  {
-                    "name": "Main version bump",
-                    "value": "${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }}"
-                  },
-                  {
-                    "name": "Release branch frozen at",
-                    "value": "${{ env.OLD_VERSION }}"
-                  },
-                  {
-                    "name": "Triggered by",
-                    "value": "${{ env.ACTOR }}"
-                  }
-                ],
-                "markdown": true
-              }
-            ],
-            "potentialAction": [
-              {
-                "@type": "OpenUri",
-                "name": "View Release Branch",
-                "targets": [
-                  {
-                    "os": "default",
-                    "uri": "https://github.com/${{ env.REPO }}/tree/release/${{ env.RELEASE_NAME }}"
-                  }
-                ]
-              }
-            ]
+            echo "release_branch=$RELEASE_BRANCH"
+            echo "source_sha=$SOURCE_SHA"
+            echo "npm_bump=$NPM_BUMP"
+            echo "next_tag=$NEXT_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Preflight OK. Cutting $RELEASE_BRANCH from $SOURCE_SHA; ${DEFAULT_BRANCH} will move to ${NEXT_TAG}."
+
+      - name: Cut release branch and bump default branch
+        id: cut
+        env:
+          RELEASE_BRANCH: ${{ steps.preflight.outputs.release_branch }}
+          SOURCE_SHA: ${{ steps.preflight.outputs.source_sha }}
+          NPM_BUMP: ${{ steps.preflight.outputs.npm_bump }}
+        run: |
+          set -euo pipefail
+
+          # Release branches in .releaserc.json collapse to a single "release/*" glob entry,
+          # matching the shape tenna-llc/fe-dispatch already runs in production. Every
+          # non-release entry (the seeded main/master/dev) is preserved untouched. The glob
+          # covers all release branches at once, so cutting a new one never edits the file
+          # and older release branches are never silently dropped from the config.
+          # A repo with no .releaserc.json (config in package.json, or none) is left alone.
+          ensure_releaserc() {
+            if [ ! -f .releaserc.json ]; then
+              echo "No .releaserc.json; skipping semantic-release config update."
+              return 0
+            fi
+
+            local desired current
+            desired=$(jq -cS --arg p "$PREID" '
+              def nm: if type == "object" then .name else . end;
+              (.branches | map(select((nm | startswith("release/")) | not)))
+              + [ ({ name: "release/*", channel: false }
+                    + (if $p == "" then {} else { prerelease: $p } end)) ]
+            ' .releaserc.json)
+            current=$(jq -cS '.branches' .releaserc.json)
+
+            if [ "$current" = "$desired" ]; then
+              echo ".releaserc.json branches already canonical; leaving it unchanged."
+              return 0
+            fi
+
+            jq --argjson b "$desired" '.branches = $b' .releaserc.json > .releaserc.json.tmp
+            mv .releaserc.json.tmp .releaserc.json
+            git add .releaserc.json
+            git commit -m "chore: collapse .releaserc.json release branches to release/* [skip ci]"
+            echo "Normalized .releaserc.json branches; release entries collapsed to release/*."
           }
-          EOF_PAYLOAD
-          )
 
-          curl -X POST -H 'Content-Type: application/json' \
-            -d "$PAYLOAD" \
-            "$TEAMS_WEBHOOK_URL"
+          # 1. Release branch, cut from the requested source.
+          git checkout -b "$RELEASE_BRANCH" "$SOURCE_SHA"
+          ensure_releaserc
+          git push origin "$RELEASE_BRANCH"
 
-          echo "✓ Teams notification sent"
+          # 2. Default branch: same config guarantee, then the version bump.
+          git checkout "$DEFAULT_BRANCH"
+          ensure_releaserc
+
+          NEW_VERSION=$(npm version "$NPM_BUMP" ${PREID:+--preid "$PREID"} -m "chore(release): %s")
+
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          git push --follow-tags origin "HEAD:${DEFAULT_BRANCH}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.cut.outputs.new_version }}
+        run: gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
 
       - name: Summary
         env:
-          RELEASE_NAME: ${{ steps.validate_name.outputs.release_name }}
-          OLD_VERSION: ${{ steps.read_version.outputs.old_version }}
-          NEW_VERSION: ${{ steps.bump_main.outputs.new_version }}
+          RELEASE_BRANCH: ${{ steps.preflight.outputs.release_branch }}
+          SOURCE_SHA: ${{ steps.preflight.outputs.source_sha }}
+          TAG: ${{ steps.cut.outputs.new_version }}
         run: |
-          echo "## Release Branch Created ✓"
-          echo ""
-          echo "| Item | Value |"
-          echo "|------|-------|"
-          echo "| Release | ${{ env.RELEASE_NAME }} |"
-          echo "| Branch | release/${{ env.RELEASE_NAME }} |"
-          echo "| Main bumped | ${{ env.OLD_VERSION }} → ${{ env.NEW_VERSION }} |"
-          echo "| Release frozen at | ${{ env.OLD_VERSION }} |"
+          {
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Release branch | \`$RELEASE_BRANCH\` |"
+            echo "| Cut from | \`$SOURCE_SHA\` |"
+            echo "| ${DEFAULT_BRANCH} now at | \`$TAG\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
